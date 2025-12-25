@@ -13,7 +13,7 @@ use dashmap::DashMap;
 use derive_builder::Builder;
 use futures::Stream;
 use reqwest::header::{HeaderMap, HeaderValue};
-use reqwest::{Client as ReqwestClient, Method, Request, StatusCode};
+use reqwest::{Client as ReqwestClient, Method, Proxy, Request, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use url::Url;
@@ -298,6 +298,94 @@ pub struct Config {
     /// Whether the [`Client`] will use the server time provided by Polymarket when creating auth
     /// headers. This adds another round trip to the requests.
     use_server_time: bool,
+    /// Optional proxy configuration for outbound requests.
+    proxy: Option<ProxyConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProxyConfig {
+    host: String,
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+impl ProxyConfig {
+    #[must_use]
+    pub fn new(host: impl Into<String>, port: u16) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            username: None,
+            password: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_basic_auth(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
+        self.username = Some(username.into());
+        self.password = Some(password.into());
+        self
+    }
+
+    pub fn from_colon_separated(spec: &str) -> Result<Self> {
+        let parts: Vec<&str> = spec.split(':').collect();
+
+        match parts.as_slice() {
+            [host, port] => {
+                let host = host.trim();
+                if host.is_empty() {
+                    return Err(Error::validation("Proxy host cannot be empty"));
+                }
+                let port = port
+                    .trim()
+                    .parse::<u16>()
+                    .map_err(|_| Error::validation("Proxy port must be a valid u16"))?;
+
+                Ok(Self::new(host, port))
+            }
+            [host, port, username, password] => {
+                let host = host.trim();
+                if host.is_empty() {
+                    return Err(Error::validation("Proxy host cannot be empty"));
+                }
+                let port = port
+                    .trim()
+                    .parse::<u16>()
+                    .map_err(|_| Error::validation("Proxy port must be a valid u16"))?;
+                let username = username.trim();
+                let password = password.trim();
+                if username.is_empty() || password.is_empty() {
+                    return Err(Error::validation(
+                        "Proxy username and password cannot be empty",
+                    ));
+                }
+
+                Ok(Self::new(host, port).with_basic_auth(username, password))
+            }
+            _ => Err(Error::validation(
+                "Proxy must be host:port or host:port:username:password",
+            )),
+        }
+    }
+
+    fn to_reqwest_proxy(&self) -> Result<Proxy> {
+        let url = format!("http://{}:{}", self.host, self.port);
+        let proxy = Proxy::all(url)?;
+
+        Ok(match (&self.username, &self.password) {
+            (Some(username), Some(password)) => proxy.basic_auth(username, password),
+            _ => proxy,
+        })
+    }
+}
+
+impl Config {
+    #[must_use]
+    pub fn with_proxy(mut self, proxy: ProxyConfig) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -752,7 +840,11 @@ impl Client<Unauthenticated> {
         headers.insert("Connection", HeaderValue::from_static("keep-alive"));
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
 
-        let client = ReqwestClient::builder().default_headers(headers).build()?;
+        let mut builder = ReqwestClient::builder().default_headers(headers);
+        if let Some(proxy) = &config.proxy {
+            builder = builder.proxy(proxy.to_reqwest_proxy()?);
+        }
+        let client = builder.build()?;
 
         Ok(Self {
             inner: Arc::new(ClientInner {
