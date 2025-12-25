@@ -16,6 +16,7 @@ use futures::Stream;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client as ReqwestClient, Method, Proxy, Request, StatusCode};
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::json;
 use url::Url;
 
@@ -44,6 +45,11 @@ const ORDER_NAME: Option<Cow<'static, str>> = Some(Cow::Borrowed("Polymarket CTF
 const VERSION: Option<Cow<'static, str>> = Some(Cow::Borrowed("1"));
 
 const TERMINAL_CURSOR: &str = "LTE="; // base64("-1")
+
+#[derive(Debug, Deserialize)]
+struct IpifyResponse {
+    ip: String,
+}
 
 /// Each [`Client`] can exist in one state at a time, i.e. [`state::Unauthenticated`] or
 /// [`state::Authenticated`].
@@ -614,6 +620,16 @@ impl<S: State> Client<S> {
             .build()?;
 
         self.request(request, None).await
+    }
+
+    pub async fn public_ip(&self) -> Result<String> {
+        let request = self
+            .client()
+            .request(Method::GET, "https://api.ipify.org?format=json")
+            .build()?;
+        let response: IpifyResponse = self.request(request, None).await?;
+
+        Ok(response.ip)
     }
 
     pub async fn server_time(&self) -> Result<Timestamp> {
