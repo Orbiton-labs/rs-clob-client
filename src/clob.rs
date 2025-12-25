@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::mem;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, U256};
@@ -212,6 +213,8 @@ impl<S: Signer, K: AuthKind> AuthenticationBuilder<'_, S, K> {
                 config: inner.config,
                 host: inner.host,
                 client: inner.client,
+                proxy_clients: inner.proxy_clients,
+                proxy_cursor: inner.proxy_cursor,
                 tick_sizes: inner.tick_sizes,
                 neg_risk: inner.neg_risk,
                 fee_rate_bps: inner.fee_rate_bps,
@@ -300,6 +303,8 @@ pub struct Config {
     use_server_time: bool,
     /// Optional proxy configuration for outbound requests.
     proxy: Option<ProxyConfig>,
+    /// Optional proxy pool for rotating proxies.
+    proxies: Vec<ProxyConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -386,6 +391,12 @@ impl Config {
         self.proxy = Some(proxy);
         self
     }
+
+    #[must_use]
+    pub fn with_proxies(mut self, proxies: Vec<ProxyConfig>) -> Self {
+        self.proxies = proxies;
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -397,6 +408,10 @@ struct ClientInner<S: State> {
     host: Url,
     /// The inner [`ReqwestClient`] used to make requests to `host`.
     client: ReqwestClient,
+    /// Optional proxy clients used for rotation.
+    proxy_clients: Vec<ReqwestClient>,
+    /// Cursor for round-robin proxy selection.
+    proxy_cursor: AtomicUsize,
     /// Local cache of [`TickSize`] per token ID
     tick_sizes: DashMap<String, TickSize>,
     /// Local cache representing whether this token is part of a `neg_risk` market
@@ -426,24 +441,69 @@ impl<S: State> ClientInner<S> {
             *request.headers_mut() = h;
         }
 
-        let response = self.client.execute(request).await?;
-        let status_code = response.status();
+        let base_request = request.try_clone();
+        let attempts = self.proxy_clients.len().max(1);
+        let mut attempt_request = request;
 
-        if !status_code.is_success() {
-            let message = response.text().await.unwrap_or_default();
+        for attempt in 0..attempts {
+            let client = self.select_client();
 
-            return Err(Error::status(status_code, method, path, message));
+            match client.execute(attempt_request).await {
+                Ok(response) => {
+                    let status_code = response.status();
+
+                    if !status_code.is_success() {
+                        if !self.proxy_clients.is_empty()
+                            && Self::should_retry_status(status_code)
+                            && attempt + 1 < attempts
+                        {
+                            let _ = response.text().await;
+
+                            if let Some(base) = base_request.as_ref().and_then(|r| r.try_clone()) {
+                                attempt_request = base;
+                                continue;
+                            }
+
+                            return Err(Error::validation(
+                                "Request body is not clonable for proxy retry",
+                            ));
+                        }
+
+                        let message = response.text().await.unwrap_or_default();
+                        return Err(Error::status(status_code, method, path, message));
+                    }
+
+                    return match response.json::<Option<Response>>().await? {
+                        Some(response) => Ok(response),
+                        None => Err(Error::status(
+                            StatusCode::NOT_FOUND,
+                            method,
+                            path,
+                            "Unable to find requested resource",
+                        )),
+                    };
+                }
+                Err(err) => {
+                    if !self.proxy_clients.is_empty()
+                        && Self::should_retry_error(&err)
+                        && attempt + 1 < attempts
+                    {
+                        if let Some(base) = base_request.as_ref().and_then(|r| r.try_clone()) {
+                            attempt_request = base;
+                            continue;
+                        }
+
+                        return Err(Error::validation(
+                            "Request body is not clonable for proxy retry",
+                        ));
+                    }
+
+                    return Err(err.into());
+                }
+            }
         }
 
-        match response.json::<Option<Response>>().await? {
-            Some(response) => Ok(response),
-            None => Err(Error::status(
-                StatusCode::NOT_FOUND,
-                method,
-                path,
-                "Unable to find requested resource",
-            )),
-        }
+        Err(Error::validation("Proxy retry exhausted without a response"))
     }
 
     pub async fn server_time(&self) -> Result<Timestamp> {
@@ -453,6 +513,30 @@ impl<S: State> ClientInner<S> {
             .build()?;
 
         self.request(request, None).await
+    }
+
+    fn select_client(&self) -> &ReqwestClient {
+        if self.proxy_clients.is_empty() {
+            return &self.client;
+        }
+
+        let idx = self.proxy_cursor.fetch_add(1, Ordering::Relaxed);
+        &self.proxy_clients[idx % self.proxy_clients.len()]
+    }
+
+    fn should_retry_status(status: StatusCode) -> bool {
+        matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT
+                | StatusCode::TOO_MANY_REQUESTS
+                | StatusCode::BAD_GATEWAY
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::GATEWAY_TIMEOUT
+        )
+    }
+
+    fn should_retry_error(err: &reqwest::Error) -> bool {
+        err.is_connect() || err.is_timeout() || err.is_request()
     }
 }
 
@@ -840,17 +924,32 @@ impl Client<Unauthenticated> {
         headers.insert("Connection", HeaderValue::from_static("keep-alive"));
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
 
-        let mut builder = ReqwestClient::builder().default_headers(headers);
+        let base_client = ReqwestClient::builder()
+            .default_headers(headers.clone())
+            .build()?;
+
+        let mut proxy_configs = Vec::new();
         if let Some(proxy) = &config.proxy {
-            builder = builder.proxy(proxy.to_reqwest_proxy()?);
+            proxy_configs.push(proxy.clone());
         }
-        let client = builder.build()?;
+        proxy_configs.extend(config.proxies.clone());
+
+        let mut proxy_clients = Vec::new();
+        for proxy in proxy_configs {
+            let client = ReqwestClient::builder()
+                .default_headers(headers.clone())
+                .proxy(proxy.to_reqwest_proxy()?)
+                .build()?;
+            proxy_clients.push(client);
+        }
 
         Ok(Self {
             inner: Arc::new(ClientInner {
                 config,
                 host: Url::parse(host)?,
-                client,
+                client: base_client,
+                proxy_clients,
+                proxy_cursor: AtomicUsize::new(0),
                 tick_sizes: DashMap::new(),
                 neg_risk: DashMap::new(),
                 fee_rate_bps: DashMap::new(),
@@ -920,6 +1019,8 @@ impl<K: AuthKind> Client<Authenticated<K>> {
                 host: inner.host,
                 config: inner.config,
                 client: inner.client,
+                proxy_clients: inner.proxy_clients,
+                proxy_cursor: inner.proxy_cursor,
                 tick_sizes: inner.tick_sizes,
                 neg_risk: inner.neg_risk,
                 fee_rate_bps: inner.fee_rate_bps,
@@ -1409,6 +1510,8 @@ impl Client<Authenticated<Normal>> {
             state,
             host: inner.host,
             client: inner.client,
+            proxy_clients: inner.proxy_clients,
+            proxy_cursor: inner.proxy_cursor,
             tick_sizes: inner.tick_sizes,
             neg_risk: inner.neg_risk,
             fee_rate_bps: inner.fee_rate_bps,
